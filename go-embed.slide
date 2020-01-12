@@ -1,0 +1,629 @@
+Implementing go:embed
+Cambridge Gophers Meetup, January 2020
+
+* What we'll cover
+
+- What is a pragma?
+- Pragma's in Go
+- The proposal [[https://github.com/golang/issues/35960][#35950]]
+- Building the Go toolchain
+- Hacking the Go toolchain
+- Implementing go:embed
+
+* What is a pragma?
+
+A pragma tells the compiler how to process the program source. For example...
+
+    #ifndef UNSTABLE
+    #pragma GCC error "Compiler flag -DUNSTABLE not set - not compiling" __FILE__
+    #endif
+
+GCC offers a wide variety of pragmas to change compiler behaviour.
+
+    #pragma GCC unroll 0
+    for (int i = 0; i < 5; i++) {
+        // do stuff...
+    }
+
+: Depending on the C compiler, can depend on the control you have over the compilation.
+: Typically in C they are used for handling machine/OS specific behaviour.
+: Can be used for controlling memory alignment with structs.
+
+* Pragmas in Go
+
+Pragmas in Go are implemented as comments.
+
+    //go:noinline
+    //go:noescape
+    //go:notinheap
+
+Some examples from src/runtime...
+
+: Not part of the official Go spec.
+: Provides "magic" behaviour.
+: Not obvious when they don't work.
+: Some are undocumented.
+
+* go:noinline
+
+Prevent a function from being inlined. Used during development of the new SSA compiler. You wouldn't use this in your code.
+
+    // src/runtime/mfinal.go
+    //go:noinline
+    func KeepAlive(x interface{}) {}
+
+* go:noescape
+
+Prevent a function argument from escaping to the heap. Used on forward declarations of functions that are implemented in assembly.
+
+If you don't know what you're doing with this pragma, you can very easily end up corrupting memory in your program.
+
+    // src/runtime/os_linux.go
+    //go:noescape
+    func clone(flags int32, stk, mp, gp, fn unsafe.Pointer) int32 // src/runtime/sys_linux_$GOARCH.s
+
+: This example shows the forward declaration of clone, which implements the clone(2) syscall on linux.
+: The assembly implementation can be found in the file added via a comment beside the forward declaration.
+
+* go:notinheap
+
+Tell the compiler that the type will be allocated from the stack and not the heap. Any heap pointers within the type must be specifically managed by the user.
+
+    // src/runtime/mfinal.go
+    //go:notinheap
+    type finblock struct {
+        ...
+    }
+
+: This shows the finblock type being something that is allocated on the stack. This is a linked list of finalizers used during object cleanup.
+
+* To summarise
+
+- Powerful and simple (few knobs to turn)
+- Need to know what's going on at a lower level
+- Used a lot throughout the compiler
+
+* The proposal
+
+Back in Decemeber issue [[https://github.com/golang/go/issues/35950][#35950]] was raised, proposing official support within the Go toolchain for static file embedding.
+
+One of the methods suggested was to use the go:embed pragma to tell the compiler that you wanted a file embedding in your program. For example, the following...
+
+    //go:embed Ladder ladder.svg
+
+would compile to this...
+
+    func Ladder() *io.SectionReader {
+        ...
+    }
+
+: Raised by one of the language maintainers, Brad Fitzpatrick, suggesting the toolchain ought to support static file embedding due to the proliferation of third-party tools out there.
+: Makes sense regarding Go, static linking, why not have static file embedding for nice all in one binaries.
+: Code generation will essentially be happening under the hood, data structures would need to implement the io.ReaderAt interface for use as a SectionReader.
+
+* The end game
+
+By the end of this we want to be able to run this sample program...
+
+    package main
+
+    import (
+        "crypto/md5"
+        "fmt"
+        "io"
+    )
+
+    //go:embed Ladder ladder.svg
+
+    func main() {
+        h := md5.New()
+        io.Copy(h, Ladder())
+        fmt.Printf("%x\n", h.Sum(nil))
+    }
+
+: Before getting to work in implementing this, we need to have a clear idea on what we want to achieve. Here is a sample program that we want to compile and execute want we've implemented the go:embed pragma.
+
+* The Go toolchain
+
+The binaries used for compilation and linking exist in $GOROOT/pkg/tool/$GOOS_$GOARCH, for example...
+
+    $ ls $GOROOT/pkg/tool/linux_amd64
+    addr2line  asm      cgo      cover  doc  link  objdump  pprof      trace
+    api        buildid  compile  dist   fix  nm    pack     test2json  vet
+
+The compiler, aptly named compile, is the tool that we will be hacking on to achieve file embedding.
+
+: GOROOT is an environment variable that tells the Go toolchain where to look for the tools, and packages to use during building of a binary.
+: For hacking on the Go toolchain we will be setting our own custom GOROOT, so we can keep the custom binaries we generate separate from our existing Go installation.
+
+* Building the Go toolchain
+
+Building the toolchain is simple enough, it's just a case of cloning, and running the make.bash script in the src/ directory.
+
+    $ git clone git@github.com:golang/go.git
+    $ cd go
+    go $ cd src/
+    src $ ./make.bash
+
+Once done two binaries will be placed in the bin directory of the source code checkout.
+
+    $ ls bin
+    go gofmt
+
+: Going forward, we will be using the custom go binary we have for building our custom compiler, and the source code checkout as the new GOROOT.
+: Using the new GOROOT is required, as compilations will fail if the compiler detects that the package being used has a different git revision than what it expects (from my experience at least).
+
+* What we want to do - broad strokes
+
+- Scan source code for the go:embed pragma
+- Add the given function name to the code
+- Implement the necessary data structures to use as a io.ReaderAt
+
+: Before we actually touch any code, it's good to note down what we want the compiler to do.
+: Most of the work has been done for us with regards to the lexing of the code, now it's just a case of figuring out where certain actions happen, and how we can expand on that.
+
+* Diving in
+
+Scanning is the first thing that happens during compilation, and is handled via the internal/syntax package.
+
+Pragmas in Go are just comments, specifically single line comments. These are handled during a call to scanner.next in internal/syntax/scanner.go
+
+    // internal/syntax/scanner.go:210
+    case '/':
+        c = s.getr()
+        if c == '/' {
+            s.lineComment()
+            goto redo
+        }
+
+: We're going to dive right into scanning here, to find out where comments are handled, then follow the thread outwards to see where exactly pragmas are implemented.
+: Calls to getr return the next rune in the scanner's buffer, depleting it.
+: As you can see, a call to the lineComment method is made when the scanner establishes that what we currently have is a single line comment.
+
+* Following the thread
+
+What does lineComment do exactly?
+
+    func (s *scanner) lineComment() {
+        r := s.getr()
+        ...
+        // recognize go: or line directives
+        prefix := "go:"
+        if r == 'l' {
+            prefix = "line"
+        }
+        for _, m := range prefix {
+            if r != m {
+                s.skipLine(r)
+                return
+            }
+            r = s.getr()
+        }
+
+        // directive text
+        s.startLit()
+        s.skipLine(r)
+        s.comment("//" + prefix + string(s.stopLit()))
+    }
+
+: From internal/syntax/scanner.go:709
+: The omitted lines check the mode of the scanner to determine if comments should be ignored or not during parsing.
+: First check if the directive is either go: or line: (the line: directive tells the compiler that the next line is in the given file at the given line).
+: We call startLit to begin buffering the string literal of the comment. 
+: The subsequent call to skipLine tells the scanner to not consume newline characters.
+: Finally we call the comment method, passing through the leading slashes, the prefix, and the string literal.
+
+* Comments are handled with errh
+
+Looking at the comment method we see this just calls errh, passing through the position of the comment literal...
+
+    func (s *scanner) comment(text string) {
+        s.errh(s.line, s.col, text)
+    }
+
+The errh property comes from the source type, which itself is embedded into the scanner...
+
+    // internal/syntax/scanner.go:30
+    type scanner struct {
+        source
+        ...
+    }
+
+    // internal/syntax/source.go:33
+    type source struct {
+        src  io.Reader
+        errh func(line, pos uint, msg string)
+        ...
+    }
+
+: The errh handler is setup during the initialisation of the parser, which in turn initialises the scanner, which initialises the source.
+: The source type represents a single input source of Go code.
+
+* Initializing the scanner
+
+The scanner is initialised during the initialisation of the parser...
+
+    // internal/syntax/parser.go:33
+    func (p *parser) init(file *PosBase, r io.Reader, errh ErrorHandler, pragh PragmaHandler, mode Mode) {
+        ...
+        p.scanner.init(
+            r,
+            func (line, col uint, msg string) {
+                ...
+                text := commentText(msg)
+                ...
+                // go: directive (but be conservative and test)
+                if pragh != nil && strings.HasPrefix(text, "go:") {
+                    p.pragma |= pragh(p.posAt(line, col+2), text) // +2 to skip over // or /*
+                }
+            },
+            directives,
+        )
+        ...
+    }
+
+: As you can see, a callback (which implements errh) is passed to the scanner during initialisation. Here we check to see if what we have is a pragma, and if so we call pragh, which is what we give to the parser for handling pragmas in the Go source.
+: The directives parameter passed after the callback is a flag that tells the scanner we want to call the handler for directives.
+: So, all of this can be traced back to pragh, which begs the question where does this come from?
+: A call to pragh will return an integer which is used to modify the p.pragma flag (bitwise OR). This keeps track of any function pragmas that are in place, such as go:noescape, or go:noinline.
+
+* Where pragh comes from
+
+The parser itself is initialised via a call to syntax.Parse from internal/gc/noder.go...
+
+    // internal/gc/noder.go:27
+    func parseFiles(filenames []string) uint {
+        noders := make([]*noder, 0, len(filenames))
+        // Limit the number of simultaneously open files.
+        sem := make(chan struct{}, runtime.GOMAXPROCS(0)+10)
+
+        for _, filename := range filenames {
+            p := &noder{
+                basemap: make(map[*syntax.PosBase]*src.PosBase),
+                err:     make(chan syntax.Error),
+            }
+            noders = append(noders, p)
+
+            go func(filename string) {
+                ...
+                p.file, _ = syntax.Parse(base, f, p.error, p.pragma, syntax.CheckBranches)
+            }(filename)
+        }
+    }
+
+and this is where pragh comes from, the pragma method on the noder type.
+
+: We went through quite a bit here, but I think it's important to do so as it paints a picture as to where the data comes from in the compiler, and how it travels through the program.
+: I haven't shown the code for the Parse function in the syntax package, but this basically initialises the parser, and passes through what we gave the Parse function.
+: The key thing here is that the pragma method belongs to the noder type, and we can now jump into it to begin implementing the go:embed pragma.
+: To summarise, the parser initialises the scanner which initialises the source. A special callback for error handling is used to handle comments too, which in turn handles pragmas.
+
+* The pragma method
+
+This can be found at internal/syntax/noder.go:1534...
+
+    func (p *noder) pragma(pos syntax.Pos, test string) syntax.Pragma) {
+        switch {
+        ...
+        case strings.HasPrefix(text, "go:linkname "):
+            f := strings.Fields(text)
+            if !(2 <= len(f) && len(f) <= 3) {
+                p.error(synax.Error{Pos: pos, Msg: "usage: //go:linkname localname [linkname]"})
+                break
+            }
+            var target string
+            if len(f) == 3 {
+                target = f[2]
+            }
+            p.linknames = append(p.linknames, linkename{pos, f[1], target})
+        ...
+        }
+    }
+
+this is a simple switch statement that goes over all the possible pragma types there are.
+
+: Here we see how the go:linkname pragma is handled. This tells the compiler to use [linkname] as the object file symbol for the variable or function declared as localname. Mainly used internally in the compiler.
+
+* Adding go:embed
+
+First we're simply going to do some checks on the go:embed pragma to make sure it's valid...
+
+    case strings.HasPrefix(text, "go:embed "):
+        f := strings.Fields(text)
+        if len(f) < 3 {
+            p.error(syntax.Error{Pos: pos, Msg: "usage: //go:embed function file"}
+            break
+        }
+        if _, err := os.Stat(f[2]); err != nil {
+            p.error(syntax.Error{Pos: pos, Msg: "//go:embed failed to stat file "+f[2]+": "+err.Error()})
+            break
+        }
+
+We can build this using our custom build go binary from previously.
+
+    $ GOROOT=<src checkout> ../bin/go install cmd/compile
+
+: Nothing too special here, we simply check to see if we have the go:embed prefix, and do some validation on the input.
+: We ensure we have the number of fields available, then make sure the file can be read via os.Stat
+: Finally, we actually install the custom compiler into our custom GOROOT, which is the source code checkout, the custom compiler will be in $GOROOT/pkg/$GOOS_$GOARCH/tool
+
+* Small steps
+
+We can test our changes by running the new compiler over a simple program...
+
+    package main
+
+    //go:embed FunctionName some-file
+
+    func main() {
+    }
+
+building is simple, again using our custom go binary, and custom GOROOT...
+
+    $ GOROOT=<src checkout> ../bin/go build embed.go
+
+This will yield an error since we're referencing a non-existent file...
+
+    # command-line-arguments
+    ./embed.go:9:3: //go:embed failed to stat file some-file: stat some-file: no such file or directory
+
+: This program is deliberately wrong, so we can actually see our changes in affect.
+
+* Tracking the embeds
+
+With each go:embed pragma defined, we will need to keep track of what's being specified.
+
+- The position (for error reporting)
+- The function name we want to add
+- The file we want to embed
+
+    // internal/gc/noder.go:274
+    type embed struct {
+        pos   syntax.Pos
+        pkg   *syntax.Name
+        fn    string
+        fname string
+    }
+
+    // internal/gc/noder.go:177
+    type noder struct {
+        ...
+        linknames []linkname
+        embeds    []embed
+        ...
+    }
+
+: Here we declare a new embed type that we use to track the information from the pragma.
+: We also add a new slice to the noder type to track the embeds we have declared in the current package being parsed.
+: We'll come back to the pkg property later on.
+
+* Collecting the embeds
+
+With the new slice in the noder type, we can add some logic to the pragma method to actually collect up all the embeds that have been declared.
+
+    // internal/gc/noder.go:1552
+    p.embeds = append(p.embeds, embed{
+        pos:   pos,
+        fn:    f[1],
+        fname: f[2],
+    })
+
+: Nothing too complicated here, just using the new type we declared, and putting it in the new struct member.
+: Once parsing has finished we will use the information to generate the code we require.
+
+* Sidenote: the noder type
+
+The noder type is responsible for transforming the package's syntax tree into a Node type, and appending the root to xtop.
+
+xtop is the variable that holds all of the nodes parsed from a source input.
+
+    // internal/gc/go.go:185
+    var xtop []*Node
+
+: We have the embeds neatly attached to each noder, but before we continue it's important to establish how exactly code is represented in the compiler during parsing.
+: The xtop slice is what contains the parsed input, and is where we want our new embedding code to end up.
+
+* What we want to do - finer strokes
+
+- Generate an input source for the io.ReaderAt implementation
+- Generate an input source for each file we're embedding
+- Feed each input source back into the parser
+
+: We have the foundation of our implementation in place. Now it's just a question of using that data in a way that makes sense.
+: We've already seen how parsing is done, so let's just give the code we want to the compiler during compilation.
+: Each embed directive will essentially be a separate source to be parsed.
+: Each function we generate however will share the same io.ReaderAt implementation for creating and io.SectionReader. This implementation will be done once per package.
+
+* What we want to do - the io.ReaderAt implementation
+
+A data structure implementing io.ReaderAt will need to exist that we can pass to io.NewSectionReader.
+
+    import "io"
+
+    type embedBuffer struct {
+        buf []byte
+        off int64
+    }
+
+    type embedErr string
+
+    func (b *embedBuffer) Read(p []byte) (int, error) {
+        ...
+    }
+
+    func (b *embedBuffer) ReadAt(p []byte, off int64) (int, error) {
+        ...
+    }
+
+    func (e embedErr) Error() string { return string(e) }
+
+: Code has been elided for brevity, but you can get the gist.
+: The Read and ReadAt methods follow the typically implementations, return io.EOF once at the end of the buffer, error out on invalid offsets, only read what we have to what we're given.
+: The io package is required so we can use io.EOF
+: The embedErr type is the error type we use so we can return an error from ReadAt if a negative offset is given.
+: This would be generated once per package.
+
+* What we want to do - the function implementation
+
+The function implementation would then use the io.ReaderAt implementation to return the io.SectionReader we need.
+
+    import "io"
+
+    func Ladder() *io.SectionReader {
+        b := []byte{0x01, 0x02, 0x03, ...}
+        return io.NewSectionReader(&embeBuffer{buf:b}, 0, <len>)
+    }
+
+: Each input source generated for each embedded file will look something like this. The function name, and contents of the buffer would be different of course.
+: We won't call len on b, since during the file embedding we will know the length of the file. So we can just have that hardcoded into the generated code.
+
+* Implementation - embed aggregation
+
+Once parsing has finished, let's aggregate all the embeds we have...
+
+    // internal/gc/noder.go:55
+    embeds := make([]embed, 0)
+
+    for _, p := range noders {
+        for e := range p.err {
+            p.yyerrorpos(e.Pos, "%s", e.Msg)
+        }
+
+        for _, e := range p.embeds {
+            e.pkg = p.file.PkgName
+            embeds = append(embeds, e)
+        }
+    }
+
+: Aggregate all the embeds, and set the package name of the embed. This will be used to ensure only one io.ReaderAt implementation will exist in each package.
+: We range over p.err, as this is a channel and the files are parsed concurrently. This will ensure the goroutines sync. up with each other, and that parsing completes as expected.
+
+* Implementation - the embedder type
+
+A new embedder will be added to handle the embedding of files.
+
+    // internal/gc/embed.go:15
+    type embedder struct {
+        packages map[string]struct{}
+        files    []string
+        dir      string
+    }
+
+    func (e *embedder) preamble(pkg *syntax.Name) string {
+        ...
+    }
+
+    func (e *embedder) embed(pos syntax.Pos, pkg *syntax.Name, fn, fname string) string {
+        ...
+    }
+
+This new type will handle generating the code we'll feed back to the parser, each method will return the name of the generated file.
+
+: This type will keep track of the packages that we're embedding files to. This will be checked each time an embed preamble is generated, to ensure the preamble only happens once per package.
+: The dir property refers to the directory where the generated files will be written.
+: preamble is used to refer to the io.ReaderAt implementation we need. I call it preamble since we want to generate this first before doing the file embedding. (Having it be done first doesn't particularly matter, logically I just find it easier to follow).
+: embed is what will generate the code that will contain the embedded file.
+
+* Implementation - using the embedder
+
+To use the embedder we simply need to instantiate it, and call the methods we need.
+
+    // internal/gc/noder.go:71
+    if len(embeds) > 0 {
+        em := embedder{
+            packages: make(map[string]struct{}),
+            dir:      filepath.Dir(outfile),
+        }
+
+        files := make([]string, 0, len(embeds)+1)
+
+        for _, e := range embeds {
+            fname = em.preamble(e.pkg)
+
+            if fname != "" {
+                files = append(files, fname)
+            }
+
+            fname = em.embed(e.pos, e.pkg, e.fn, e.fname)
+            files = append(files, fname)
+        }
+
+        lines += parseFiles(files)
+    }
+
+: We append each file name returned from the embedder to a slice of strings, which we then give back to parsFiles (the function we're currently in).
+
+* Implementation - using the embedder
+
+We then let the rest of the files be parsed.
+
+    // internal/gc/noder.go:103
+    for _, p := range noders {
+        p.node()
+        lines += p.file.Lines
+        p.file = nil // release memory
+
+        if nsyntaxerrors != 0 {
+            errorexit()
+        }
+        // Always run testdclstack here, even when debug_dclstack is not set, as a sanity measure
+        testdclstack()
+    }
+
+* Implementation - implementing preamble
+
+    if _, ok := e.packages[pkg.Value]; ok {
+        return ""
+    }
+    if _, ok := packageFile["io"]; !ok {
+        pkg := filepath.Join(objabi.GOROOT, "pkg")
+        env := objabi.GOOS + "_" + objabi.GOARCH
+        if flag_race {
+            env += "_race"
+        }
+        packageFile["io"] = filepath.Join(pkg, env, "io.a")
+    }
+
+    fname := filepath.Join(objabi.GOROOT, "misc", "embed", "preamble.go")
+
+    dst, _ := ioutil.TempFile(e.dir, "embed_preamble")
+    defer dst.Close()
+
+    e.files = append(e.files, dst.Name())
+
+    src, _ := os.Open(fname)
+    defer src.Close()
+
+    dst.WriteString("package "+pkg.Value)
+    io.Copy(dst, src)
+
+    e.packages[pkg.Value] = struct{}{}
+    return dst.Name()
+
+: This is the implementation for the preamble method on the embedder type.
+: First we check to see if the package has already had preamble generated for it.
+: Next, we check to see if the packageFile has the io dependency correctly set. If not, then we set the io dependency accordingly. As you can see we check to see if the -race flag has been set, and if so use the appropriate package.
+: The actual code that we're using is just a static file I added into the GOOROOT within misc/embed. The implementation will always be the same, and it made sense to me to have this in the misc directory of the GOROOT. 
+: Before actually copying the file we have in misc/embed we set the package name of the file.
+: All of this is written to a temporary file in the same directory where compilation happens.
+
+* Sidenote: packageFile and importcfg
+
+The packageFile variable is a representation of the contents of the importcfg file. This tells the compiler and linker where different package files are.
+
+    $ go tool compile -importcfg importcfg
+
+For more information see commit [[https://github.com/golang/go/commit/0be2d52ebaa85c4d055bde4239a6698d7135ca3e][0be2d52eba]] in golang/go.
+
+: The check we do on packageFile is not required, removing this code will still let us compile the code we're generating via the compile tool itself.
+: We add this in however, as the go build command actually generates the importcfg file that is fed to the compiler.
+: So, if we have a program that doesn't have an io package imported, but is embedding a file, that is built via go build, then a compilation error will occur as the generated importcfg file will not have the io package in it.
+
+* Implementation - implementing embed
+
+    f, _ := ioutil.TempFile(e.dir, "embed_"+fname)
+    defer f.Close()
+
+    fmt.Fprintf(f, "package %s\n\n", pkg.Value)
+    fmt.Fprintf(f, "import \"io\"\n\n")
+    fmt.Fprintf(f, "func %s() *io.SectionReader {\n", fn)
