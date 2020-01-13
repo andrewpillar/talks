@@ -1,5 +1,8 @@
 Implementing go:embed
-Cambridge Gophers Meetup, January 2020
+Cambridge Gophers Meetup
+23 Jan 2020
+
+Andrew Pillar
 
 * What we'll cover
 
@@ -415,13 +418,21 @@ With the new slice in the noder type, we can add some logic to the pragma method
 
 The noder type is responsible for transforming the package's syntax tree into a Node type, and appending the root to xtop.
 
-xtop is the variable that holds all of the nodes parsed from a source input.
+xtop is the variable that holds all of the nodes parsed from an input source.
 
     // internal/gc/go.go:185
     var xtop []*Node
 
 : We have the embeds neatly attached to each noder, but before we continue it's important to establish how exactly code is represented in the compiler during parsing.
 : The xtop slice is what contains the parsed input, and is where we want our new embedding code to end up.
+
+* How will the files be embedded?
+
+Generate code to give back to the parser, a naive yet simple approach...
+
+: For this implementation of go:embed we will simply be hijacking the parser to do the leg work for us.
+: We know how the parser is initialized, we know that it generates the syntax tree for AST conversion, so it makes sense.
+: At the end I will touch on other solutions to implementing go:embed.
 
 * What we want to do - finer strokes
 
@@ -462,6 +473,7 @@ A data structure implementing io.ReaderAt will need to exist that we can pass to
 : The io package is required so we can use io.EOF
 : The embedErr type is the error type we use so we can return an error from ReadAt if a negative offset is given.
 : This would be generated once per package.
+: Since this is a static implementation it will make sense to place it in the GOROOT for the compiler to use during code generation.
 
 * What we want to do - the function implementation
 
@@ -505,7 +517,6 @@ A new embedder will be added to handle the embedding of files.
     // internal/gc/embed.go:15
     type embedder struct {
         packages map[string]struct{}
-        files    []string
         dir      string
     }
 
@@ -517,11 +528,12 @@ A new embedder will be added to handle the embedding of files.
         ...
     }
 
-This new type will handle generating the code we'll feed back to the parser, each method will return the name of the generated file.
+This new type will generate the code we'll feed back to the parser.
 
 : This type will keep track of the packages that we're embedding files to. This will be checked each time an embed preamble is generated, to ensure the preamble only happens once per package.
 : The dir property refers to the directory where the generated files will be written.
 : preamble is used to refer to the io.ReaderAt implementation we need. I call it preamble since we want to generate this first before doing the file embedding. (Having it be done first doesn't particularly matter, logically I just find it easier to follow).
+: The generated code will be written to a file created via TempFile, the filename of this will be returned.
 : embed is what will generate the code that will contain the embedded file.
 
 * Implementation - using the embedder
@@ -538,14 +550,11 @@ To use the embedder we simply need to instantiate it, and call the methods we ne
         files := make([]string, 0, len(embeds)+1)
 
         for _, e := range embeds {
-            fname = em.preamble(e.pkg)
-
-            if fname != "" {
+            if fname := em.preamble(e.pkg); fname != "" {
                 files = append(files, fname)
             }
 
-            fname = em.embed(e.pos, e.pkg, e.fn, e.fname)
-            files = append(files, fname)
+            files = append(files, em.embed(e.pos, e.pkg, e.fn, e.fname))
         }
 
         lines += parseFiles(files)
@@ -575,7 +584,7 @@ We then let the rest of the files be parsed.
     if _, ok := e.packages[pkg.Value]; ok {
         return ""
     }
-    if _, ok := packageFile["io"]; !ok {
+    if _, ok := packageFile["io"]; !ok && packageFile != nil {
         pkg := filepath.Join(objabi.GOROOT, "pkg")
         env := objabi.GOOS + "_" + objabi.GOARCH
         if flag_race {
@@ -586,7 +595,7 @@ We then let the rest of the files be parsed.
 
     fname := filepath.Join(objabi.GOROOT, "misc", "embed", "preamble.go")
 
-    dst, _ := ioutil.TempFile(e.dir, "embed_preamble")
+    dst, _ := ioutil.TempFile(e.dir, "embed_preamble*.go")
     defer dst.Close()
 
     e.files = append(e.files, dst.Name())
@@ -623,7 +632,82 @@ For more information see commit [[https://github.com/golang/go/commit/0be2d52eba
 
     f, _ := ioutil.TempFile(e.dir, "embed_"+fname)
     defer f.Close()
+    ...
+    src, _ := os.Open(fname)
+    defer src.Close()
 
-    fmt.Fprintf(f, "package %s\n\n", pkg.Value)
-    fmt.Fprintf(f, "import \"io\"\n\n")
-    fmt.Fprintf(f, "func %s() *io.SectionReader {\n", fn)
+    br := bufio.NewReader(src)
+    l := int64(0)
+
+    for {
+        b, err := br.ReadByte()
+
+        if err != nil {
+            break
+        }
+
+        fmt.Fprintf(f, "%#02x", b)
+
+        if l != end - 1 {
+            f.WriteString(", ")
+        }
+        l++
+    }
+    ...
+
+: This is the implementation for the embed method on the embedder type.
+: The start of the function has been elided, this basically sets up the package name, the io import, and the function declaration that will return the io.SectionReader
+: Within the main loop we simply iterate over each byte in the file being embedded and write it to the generated code represented as a hexadecimal character. 
+: We keep track of the number of bytes being written via the l variable, this is also written to the generated code when we return the io.SectionReader via the call to io.NewSectionReader.
+
+* Something to note on file generation
+
+The go build command creates a directory named /tmp/go-build[0-9]+ where it stores files during the build process. The compiler has access to this via the -o flag, for example...
+
+   $ go tool compile -o /tmp/go-build1234
+
+This directory is cleaned up after each build completes.
+
+Because of this, we don't need to worry about cleaning up the new embed files we generate for go:embed, at least for builds created via go build/go run.
+
+* Testing what we have
+
+If we build and run the sample program using the new compiler, we should get the following...
+
+    $ cat embed.go
+    package main
+
+    import (
+        "crypto/md5"
+        "fmt"
+        "io"
+    )
+
+    //go:embed Ladder ladder.svg
+
+    func main() {
+        h := md5.New()
+        io.Copy(h, Ladder())
+        fmt.Printf("%x\n", h.Sum(nil))
+    }
+    $ GOROOT=<src checkout> ./go build embed.go
+    ./embed
+    e5efa8c117684bb12284e5ec71b5382e
+
+: Switch to terminal for demo here.
+
+* Other approaches (perhaps more elegant than adhoc code gen...)
+
+- Modifying the AST during compilation to add the nodes we need for embedding
+- Have the go tool register each file with the runtime
+
+: The AST modification was something I tried on my first attempt of implementing this pragma. It proved fickle, since each new node needed a precise position (line, column pair) to be part of the tree, otherwise rather horrifying stackoverlows would happen when the compiler tried to resolve a zero-value position of a node.
+: This was taken from the proposal thread, the runtime would have a map of each file embedded in the ELF binary, with an address mapping to the file's contents.
+: The problems with this solution is that we're adding new implicit types to the user's code on the fly - this can cause errors to occur if, just by happenstance, the user is already using a type such as embedBuffer or embedErr.
+: Why didn't I do the approach of mapping it into the runtime? Simply put, I wanted this talk to act as an entry point into the compiler, and give you an idea as to how you might approach hacking on the internals, also I am not too familiar on the deeper intricacies of the runtime - just high-level stuff such as the fact that it does GC, and M:N hybrid thread management of goroutines.
+
+* Further reading
+
+- [[https://eli.thegreenplace.net/2019/go-compiler-internals-adding-a-new-statement-to-go-part-1/][Go compiler internals: adding a new statement to Go - Part 1]]
+- [[https://eli.thegreenplace.net/2019/go-compiler-internals-adding-a-new-statement-to-go-part-2/][Go compiler internals: adding a new statement to Go - Part 2]]
+- [[https://www.youtube.com/watch?v=KINIAgRpkDA][The design of the Go assembler]]
