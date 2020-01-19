@@ -165,6 +165,20 @@ Once done two binaries will be placed in the bin directory of the source code ch
 : Before we actually touch any code, it's good to note down what we want the compiler to do.
 : Most of the work has been done for us with regards to the lexing of the code, now it's just a case of figuring out where certain actions happen, and how we can expand on that.
 
+* The compiler - a high-level overview
+
+1. Parsing
+2. Type-checking and AST transformations
+3. Generic SSA
+4. Generating machine code
+
+: Here is a high-level overview of how the Go compiler works.
+: First, it parses the source code is tokenized, then parsed for syntax analysis, and a syntax tree is made for each source file.
+: The AST is then type checked, the first steps are name resolution and type inference. This determines which object belongs to which identifier. Type checking includes steps such as "declared and not used"
+: The AST is then converted into SSA, a lower-level intermediate representation that is used for code optimization. This is where function intrinsics are applied. Certain nodes are lowered into simpler components, such as range into normal for loops, and the copy builtin is replaced by memory moves.
+: Finally, the machine code generation phase begins with the lower pass, which rewrites generic values into their machine-specific variants. Once the SSA has been lowered, the final optimization passes are run. The assembler is then invoked (cmd/internal/obj), which generates the final object code.
+: In this talk we'll mainly be focussing on the compiler frontend.
+
 * Diving in
 
 Scanning is the first thing that happens during compilation, and is handled via the internal/syntax package.
